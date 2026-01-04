@@ -271,12 +271,59 @@ OUTPUT: Valid JSON array only, no other text."""
 
 
 def _extract_json_array(content: str) -> list[dict]:
-    """Extract JSON array from LLM response."""
+    """Extract JSON array from LLM response with error recovery."""
     content = content.strip()
+
+    # Find JSON array
     match = re.search(r"\[.*]", content, re.DOTALL)
     if not match:
-        raise ValueError("No JSON array found in response")
-    return json.loads(match.group(0))
+        log("WARNING: No JSON array found in response, returning empty list")
+        return []
+
+    json_str = match.group(0)
+
+    # Try to parse as-is first
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        log(f"WARNING: JSON parse error: {e}. Attempting repair...")
+
+    # Try common fixes
+    try:
+        # Fix 1: Remove trailing commas before ] or }
+        fixed = re.sub(r',\s*([}\]])', r'\1', json_str)
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        # Fix 2: Replace single quotes with double quotes
+        fixed = json_str.replace("'", '"')
+        fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        # Fix 3: Try to extract individual objects and rebuild array
+        objects = re.findall(r'\{[^{}]*\}', json_str)
+        if objects:
+            result = []
+            for obj_str in objects:
+                try:
+                    obj = json.loads(obj_str)
+                    if 'title' in obj:  # Valid story object
+                        result.append(obj)
+                except json.JSONDecodeError:
+                    continue
+            if result:
+                log(f"Recovered {len(result)} objects from malformed JSON")
+                return result
+    except Exception:
+        pass
+
+    log("WARNING: Could not parse JSON, returning empty list")
+    return []
 
 
 def get_all_articles(
