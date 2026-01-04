@@ -4,13 +4,12 @@ Fetches, filters, and generates newsletters focused on AI safety and security co
 """
 import json
 import re
-from datetime import datetime
-from typing import Any
-
 import requests
 import streamlit as st
+from datetime import datetime
 from dateutil.parser import isoparse
 from openai import OpenAI
+from typing import Any
 
 from constants import AI_SAFETY_TERMS, AI_ORGANIZATIONS
 
@@ -93,7 +92,7 @@ def fetch_news_from_serper(query: str, time_frame: str = "qdr:d") -> list[dict[s
         "X-API-KEY": st.secrets["SERPER_API_KEY"],
         "Content-Type": "application/json"
     }
-    
+
     for page in range(1, MAX_PAGES + 1):
         payload = json.dumps({
             "q": query,
@@ -101,26 +100,26 @@ def fetch_news_from_serper(query: str, time_frame: str = "qdr:d") -> list[dict[s
             "page": page,
             "tbs": time_frame
         })
-        
+
         response = requests.post(SERPER_URL, headers=headers, data=payload, timeout=30)
         if response.status_code != 200:
             log(f"ERROR: Serper API failed for '{query}' page {page}: {response.status_code}")
             break
-        
+
         raw_articles = response.json().get("news", [])
         if not raw_articles:
             break  # No more results
-        
+
         # Filter and format this page
         filtered = _filter_and_format_articles(raw_articles)
         all_articles.extend(filtered)
-        
+
         log(f"'{query}' page {page}: {len(raw_articles)} raw -> {len(filtered)} relevant")
-        
+
         # If we got fewer than expected, probably no more pages
         if len(raw_articles) < 10:
             break
-    
+
     return all_articles
 
 
@@ -130,10 +129,10 @@ def _filter_and_format_articles(articles: list[dict]) -> list[dict[str, Any]]:
     for article in articles:
         title = article.get("title", "")
         description = article.get("snippet", "")
-        
+
         if not is_ai_safety_related(title, description):
             continue
-        
+
         pub_date = _parse_date(article.get("date", ""))
         filtered.append({
             "title": title,
@@ -160,14 +159,28 @@ def _chunk_list(items: list, chunk_size: int):
 
 
 def _format_articles_for_prompt(articles: list[dict]) -> str:
-    """Format articles into a text block for LLM prompts."""
+    """Format articles/stories into a text block for LLM prompts."""
     lines = []
     for i, art in enumerate(articles, start=1):
-        lines.append(f"""
-[{i}] "{art['title']}"
-Source: {art['source']} | Published: {art['publishedAt']}
-Summary: {art['description']}
-Link: {art['url']}""")
+        # Handle both article format (source string) and story format (sources array)
+        if 'sources' in art and isinstance(art['sources'], list):
+            # Story format with multiple sources
+            sources_text = ", ".join(
+                f"{s.get('source', 'Unknown')} ({s.get('url', '')})"
+                for s in art['sources']
+            )
+            lines.append(f"""
+[{i}] "{art.get('title', '')}"
+Sources: {sources_text}
+Published: {art.get('publishedAt', '')}
+Summary: {art.get('description', '')}""")
+        else:
+            # Original article format
+            lines.append(f"""
+[{i}] "{art.get('title', '')}"
+Source: {art.get('source', '')} | Published: {art.get('publishedAt', '')}
+Summary: {art.get('description', '')}
+Link: {art.get('url', '')}""")
     return "\n".join(lines)
 
 
@@ -187,28 +200,32 @@ Sources: {sources_text}""")
 
 
 def reduce_articles_batch(
-    articles: list[dict],
-    provider: str = "openai",
-    model: str | None = None
+        items: list[dict],
+        provider: str = "openai",
+        model: str | None = None
 ) -> list[dict]:
-    """Use LLM to filter, prioritize, and merge articles about same stories."""
+    """Use LLM to filter, prioritize, and merge articles/stories."""
     if model is None:
         model = DEFAULT_MODELS[provider]
-    
-    client = get_client(provider)
-    articles_text = _format_articles_for_prompt(articles)
 
-    prompt = f"""You filter and merge news articles for an AI safety newsletter.
+    client = get_client(provider)
+    items_text = _format_articles_for_prompt(items)
+
+    # Detect if we're processing stories (already have sources array) or articles
+    is_stories = any('sources' in item for item in items)
+    item_type = "stories" if is_stories else "articles"
+
+    prompt = f"""You filter and merge news {item_type} for an AI safety newsletter.
 
 TASK: 
-1. Group articles about the SAME story/event together
+1. Group {item_type} about the SAME story/event together
 2. Select 10-20 most important UNIQUE stories about AI safety
-3. For each story, keep ALL source links
+3. For each story, combine ALL source links from merged items
 
 MERGE RULES:
-- Articles about the same event = ONE story with multiple sources
-- Example: "Grok generates harmful images" from Reuters, CNBC, BBC = ONE story with 3 sources
-- Pick the best title and description, but include ALL URLs
+- Items about the same event = ONE story with combined sources
+- Example: "Grok generates harmful images" from multiple sources = ONE story
+- Pick the best title and description, combine ALL source URLs
 
 OUTPUT FORMAT - JSON array of story objects:
 [
@@ -218,8 +235,7 @@ OUTPUT FORMAT - JSON array of story objects:
     "publishedAt": "2024-01-03T...",
     "sources": [
       {{"source": "Reuters", "url": "https://..."}},
-      {{"source": "CNBC", "url": "https://..."}},
-      {{"source": "BBC", "url": "https://..."}}
+      {{"source": "CNBC", "url": "https://..."}}
     ]
   }}
 ]
@@ -234,23 +250,23 @@ PRIORITIZE stories about:
 EXCLUDE:
 - Routine product announcements without safety implications
 - Clickbait or low-quality sources
-- Articles only tangentially related to AI
+- Items only tangentially related to AI
 
-ARTICLES TO PROCESS:
-{articles_text}
+{item_type.upper()} TO PROCESS:
+{items_text}
 
 OUTPUT: Valid JSON array only, no other text."""
 
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": "You merge news articles about same events. Output valid JSON only."},
+            {"role": "system", "content": "You merge news items about same events. Output valid JSON only."},
             {"role": "user", "content": prompt}
         ]
     )
-    
+
     result = _extract_json_array(response.choices[0].message.content)
-    log(f"[{provider}/{model}] Merged {len(articles)} articles -> {len(result)} stories")
+    log(f"[{provider}/{model}] Merged {len(items)} {item_type} -> {len(result)} stories")
     return result
 
 
@@ -264,25 +280,25 @@ def _extract_json_array(content: str) -> list[dict]:
 
 
 def get_all_articles(
-    search_terms: list[str],
-    time_frame: str = "qdr:d",
-    provider: str = "openai",
-    filter_model: str | None = None
+        search_terms: list[str],
+        time_frame: str = "qdr:d",
+        provider: str = "openai",
+        filter_model: str | None = None
 ) -> list[dict]:
     """
     Fetch articles for all search terms, deduplicate, and reduce via LLM.
     """
     if filter_model is None:
         filter_model = DEFAULT_MODELS[provider]
-    
+
     log(f"Starting search with {len(search_terms)} terms (timeframe: {time_frame})...")
     log(f"Filter: {provider}/{filter_model}")
     all_articles = []
-    
+
     # Fetch from each search term (with pagination)
     for term in search_terms:
         all_articles.extend(fetch_news_from_serper(term, time_frame))
-    
+
     # Add general AI safety searches
     safety_queries = ["AI safety", "AI risk", "AI regulation", "AI alignment"]
     log(f"Adding {len(safety_queries)} safety-specific queries...")
@@ -294,7 +310,7 @@ def get_all_articles(
     # Deduplicate by URL first (exact duplicates)
     unique = _deduplicate_by_url(all_articles)
     log(f"After URL dedup: {len(unique)} unique articles")
-    
+
     if not unique:
         log("No articles found!")
         return []
@@ -310,12 +326,12 @@ def get_all_articles(
         for i, chunk in enumerate(chunks, 1):
             log(f"Processing chunk {i}/{len(chunks)}...")
             merged.extend(reduce_articles_batch(chunk, provider, filter_model))
-    
+
     # Final merge pass if we had multiple chunks
     if len(merged) > 25:
         log(f"Final merge pass on {len(merged)} stories...")
         merged = reduce_articles_batch(merged, provider, filter_model)
-    
+
     log(f"Final story count: {len(merged)}")
     return merged
 
@@ -347,10 +363,10 @@ def create_newsletter_prompt(stories: list[dict], time_frame: str = "qdr:d") -> 
     stories.sort(key=lambda x: x.get("publishedAt", ""), reverse=True)
     stories_text = _format_stories_for_prompt(stories)
     orgs_text = ", ".join(AI_ORGANIZATIONS[:15])
-    
+
     current_date = datetime.now().strftime("%B %d, %Y")
     period_label = _get_period_label(time_frame)
-    
+
     # Number stories for tracking
     story_numbers = ", ".join(f"[{i+1}]" for i in range(len(stories)))
 
@@ -453,7 +469,7 @@ def _clean_newsletter_formatting(content: str) -> str:
     """Fix common formatting issues in generated newsletter."""
     lines = content.split('\n')
     cleaned = []
-    
+
     for line in lines:
         # Fix broken bold formatting in story lines
         if line.strip().startswith('- **') or line.strip().startswith('**'):
@@ -463,7 +479,7 @@ def _clean_newsletter_formatting(content: str) -> str:
                 parts = line.split(' — ', 1)
                 headline_part = parts[0]
                 rest = parts[1] if len(parts) > 1 else ''
-                
+
                 # Clean headline: should be "- **Title**" or "**Title**"
                 # Remove stray ** from inside headline
                 if headline_part.startswith('- **'):
@@ -475,35 +491,35 @@ def _clean_newsletter_formatting(content: str) -> str:
                 else:
                     prefix = ''
                     title = headline_part
-                
+
                 # Remove any ** from inside the title
                 title = title.replace('**', '')
                 # Remove brackets around title
                 title = title.strip('[]')
-                
+
                 # Reconstruct
                 line = f"{prefix}{title}** — {rest}"
-        
+
         cleaned.append(line)
-    
+
     return '\n'.join(cleaned)
 
 
 def generate_newsletter(
-    stories: list[dict],
-    time_frame: str = "qdr:d",
-    provider: str = "openai",
-    model: str | None = None
+        stories: list[dict],
+        time_frame: str = "qdr:d",
+        provider: str = "openai",
+        model: str | None = None
 ) -> str:
     """Generate the final newsletter using specified provider and model."""
     if model is None:
         model = DEFAULT_MODELS[provider]
-    
+
     client = get_client(provider)
     log(f"Generating newsletter from {len(stories)} stories...")
     log(f"Generation: {provider}/{model}")
     prompt = create_newsletter_prompt(stories, time_frame)
-    
+
     system_msg = f"""You write AI safety newsletters with STRICT formatting:
 
 FORMAT each story EXACTLY like this:
@@ -516,7 +532,7 @@ RULES:
 4. One blank line between each story
 5. Each of the {len(stories)} stories appears in only ONE section
 6. Same event = ONE entry (combine sources)"""
-    
+
     response = client.chat.completions.create(
         model=model,
         messages=[
@@ -524,7 +540,7 @@ RULES:
             {"role": "user", "content": prompt}
         ]
     )
-    
+
     raw_content = response.choices[0].message.content
     cleaned = _clean_newsletter_formatting(raw_content)
     log("Newsletter generated and cleaned successfully!")
